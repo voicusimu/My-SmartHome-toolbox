@@ -1,0 +1,16 @@
+[Unit]
+Description=Shelly Wall Display Thermostat HTTP Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=homebridge
+WorkingDirectory=/home/homebridge/shelly-thermo-proxy
+ExecStart=/opt/homebridge/bin/node /home/homebridge/shelly-thermo-proxy/shellywdserver.js
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
