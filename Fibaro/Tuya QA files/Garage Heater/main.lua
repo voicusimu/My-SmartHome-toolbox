@@ -1,3 +1,4 @@
+-- Final 2026-10-28: explicit QuickAppChild mappings; numeric child IDs.
 -- 2026-10-28: TCP keepalive, temperature deduplication, elapsed-time estimated energy.
 -- Thermostat auto should handle actions: setThermostatMode, setCoolingThermostatSetpoint, setHeatingThermostatSetpoint
 -- Proeprties that should be updated:
@@ -229,7 +230,7 @@ function QuickApp:childDeviceExist(deviceId)
 end
 
 function QuickApp:initChildDevice(variableName, deviceName, type, class)
-    local childId = self:getVariable(variableName)
+    local childId = tonumber(self:getVariable(variableName))
 
     if(self:childDeviceExist(childId) == false) then
         local child = self:createChildDevice({
@@ -247,16 +248,16 @@ end
 
 function QuickApp:createChildDevices()
     self:initChildDevices({
-        ["com.fibaro.energyMeter"] = Meter,
-        ["com.fibaro.powerMeter"] = PowerSensor,
+        ["com.fibaro.energyMeter"] = QuickAppChild,
+        ["com.fibaro.powerMeter"] = QuickAppChild,
     })
     
     -- total energy consumed (kWh)
-    self.childs.totalEnergyChild = self:initChildDevice("totalEnergyChild", "Garage heater energy consumption", "com.fibaro.energyMeter", Meter)
+    self.childs.totalEnergyChild = self:initChildDevice("totalEnergyChild", "Garage heater energy consumption", "com.fibaro.energyMeter", QuickAppChild)
     self.childs.totalEnergyChild:updateProperty("rateType", "consumption")
 
     -- current consumption (W)
-    self.childs.currentPowerChild = self:initChildDevice("currentPowerChild", "Garage heater power consumption", "com.fibaro.powerMeter", PowerSensor)
+    self.childs.currentPowerChild = self:initChildDevice("currentPowerChild", "Garage heater power consumption", "com.fibaro.powerMeter", QuickAppChild)
     self.childs.currentPowerChild:updateProperty("rateType", "consumption")
 end
 

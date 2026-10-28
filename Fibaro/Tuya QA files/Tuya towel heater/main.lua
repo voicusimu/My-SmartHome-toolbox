@@ -1,3 +1,4 @@
+-- Final 2026-10-28: explicit QuickAppChild mappings; numeric child IDs.
 -- 2026-10-28: deduplicate temperature forwarding; TCP error diagnostics; 15s heartbeat.
 -- Thermostat auto should handle actions: setThermostatMode, setCoolingThermostatSetpoint, setHeatingThermostatSetpoint
 -- Proeprties that should be updated:
@@ -40,7 +41,14 @@ function QuickApp:onInit()
     self.enabled = api.get("/devices/"..self.id).enabled
     self.showdebug = true
     self.connect_timeout = (tonumber(self:getVariable("timeout")) or 5) * 1000
-    self.temperatureDeviceId = tonumber(self:getVariable("temperatureDeviceId")) or 488
+    -- Inspect optional variables directly: getVariable warns when a name is absent.
+    self.temperatureDeviceId = 488
+    for _, variable in ipairs(self.properties.quickAppVariables or {}) do
+        if variable.name == "temperatureDeviceId" then
+            self.temperatureDeviceId = tonumber(variable.value) or 488
+            break
+        end
+    end
     self._lastForwardedTemperature = nil
     self.devID = self:getVariable("devID")
     self.devKEY = self:getVariable("devKEY")
@@ -166,7 +174,7 @@ function QuickApp:childDeviceExist(deviceId)
 end
 
 function QuickApp:initChildDevice(variableName, deviceName, type, class)
-    local childId = self:getVariable(variableName)
+    local childId = tonumber(self:getVariable(variableName))
 
     if(self:childDeviceExist(childId) == false) then
         local child = self:createChildDevice({
@@ -184,16 +192,16 @@ end
 
 function QuickApp:createChildDevices()
     self:initChildDevices({
-        ["com.fibaro.energyMeter"] = Meter,
-        ["com.fibaro.powerMeter"] = PowerSensor,
+        ["com.fibaro.energyMeter"] = QuickAppChild,
+        ["com.fibaro.powerMeter"] = QuickAppChild,
     })
     
     -- total energy consumed (kWh)
-    self.childs.totalEnergyChild = self:initChildDevice("totalEnergyChild", "Towel heater energy consumption", "com.fibaro.energyMeter", Meter)
+    self.childs.totalEnergyChild = self:initChildDevice("totalEnergyChild", "Towel heater energy consumption", "com.fibaro.energyMeter", QuickAppChild)
     self.childs.totalEnergyChild:updateProperty("rateType", "consumption")
 
     -- current consumption (W)
-    self.childs.currentPowerChild = self:initChildDevice("currentPowerChild", "Towel heater power consumption", "com.fibaro.powerMeter", PowerSensor)
+    self.childs.currentPowerChild = self:initChildDevice("currentPowerChild", "Towel heater power consumption", "com.fibaro.powerMeter", QuickAppChild)
     self.childs.currentPowerChild:updateProperty("rateType", "consumption")
 end
 
