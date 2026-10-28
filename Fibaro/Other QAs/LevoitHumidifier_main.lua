@@ -1,5 +1,6 @@
 --[[---------------------------------------------------------
-  QuickApp: VeSync Levoit Dual 200S (Cloud) - FIXED setters + debug flag + display status label
+  QuickApp: VeSync Levoit Dual 200S (Cloud) - final 2026-10-28
+  Verified VeSync authentication profile; explicit humidity child initialization.
 
   Fixes based on your real device + plugin behavior:
     ✅ Target humidity setter:
@@ -134,9 +135,9 @@ end)()
 -- ---------- constants ----------
 local LANG = "en"
 local TIMEZONE = "Europe/Bucharest"
-local AUTH_APP_VERSION = "5.7.16"
+local AUTH_APP_VERSION = "5.6.60"
 local AUTH_CLIENT_VERSION = "VeSync " .. AUTH_APP_VERSION
-local AUTH_CLIENT_INFO = "SM N9005"
+local AUTH_CLIENT_INFO = "pyvesync"
 local AUTH_OS_INFO = "Android"
 local BYPASS_UA = "okhttp/3.12.1"
 
@@ -221,6 +222,8 @@ function QuickApp:onInit()
   self:inf("apiHost=" .. tostring(self.baseUrl) .. " countryCode=" .. tostring(self.countryCode))
   self:inf("deviceName=" .. tostring(self.deviceName) .. " pollSeconds=" .. tostring(self.pollSeconds))
 
+  -- Initialize existing children explicitly before HC3's automatic fallback.
+  self:initChildDevices({ ["com.fibaro.humiditySensor"] = QuickAppChild })
   self:ensureHumidityChild()
 
   self:safeUpdateView("lblStatus", "text", "Loading...")
@@ -246,44 +249,48 @@ end
 -- Child humidity sensor
 -- ------------------------------------------------------------
 function QuickApp:ensureHumidityChild()
-  if self.hChildId then
-    self:inf("Humidity child id=" .. tostring(self.hChildId))
-    return
-  end
-
-  local found = nil
-  if self.childDevices then
-    for _, ch in pairs(self.childDevices) do
-      if ch and ch.id then
-        local nm = (ch.name or ""):lower()
-        if nm:find("humidity") then found = ch.id break end
+  local children = self.childDevices or {}
+  local child = self.hChildId and children[self.hChildId] or nil
+  if not child or child.type ~= "com.fibaro.humiditySensor" then
+    child = nil
+    for _, candidate in pairs(children) do
+      if candidate.type == "com.fibaro.humiditySensor" then
+        child = candidate
+        break
       end
     end
   end
 
-  if found then
-    self.hChildId = found
-    self:setVariable("humidityChildId", tostring(found))
-    self:inf("Found existing humidity child id=" .. tostring(found))
-    return
+  if not child then
+    self:inf("Creating humidity child device...")
+    local props = {
+      name = "Humidity",
+      type = "com.fibaro.humiditySensor",
+      initialProperties = { value = 0, unit = "%" }
+    }
+    local ok, result = pcall(function()
+      return self:createChildDevice(props, QuickAppChild)
+    end)
+    if not ok or not result or not result.id then
+      self.hChildId = nil
+      self:wrn("Failed to create humidity child (continuing without).")
+      return
+    end
+    child = result
   end
 
-  self:inf("Creating humidity child device...")
-  local props = { name = "Humidity", type = "com.fibaro.humiditySensor", initialProperties = { value = 0 } }
-  local ok, childId = pcall(function() return self:createChildDevice(props) end)
-  if ok and childId then
-    self.hChildId = childId
-    self:setVariable("humidityChildId", tostring(childId))
-    self:inf("Created humidity child id=" .. tostring(childId))
-  else
-    self:wrn("Failed to create humidity child (continuing without).")
-  end
+  self.hChildId = child.id
+  self:setVariable("humidityChildId", tostring(child.id))
+  self:inf("Humidity child id=" .. tostring(child.id))
 end
 
 function QuickApp:updateHumidityChild(val)
-  if not self.hChildId then return end
-  local h = tonumber(val); if not h then return end
-  pcall(function() fibaro.call(self.hChildId, "updateProperty", "value", h) end)
+  local h = tonumber(val)
+  if not h or h ~= h or h < 0 or h > 100 then return end
+  local child = self.hChildId and self.childDevices and self.childDevices[self.hChildId]
+  if not child then return end
+  local ok, err = pcall(function() child:updateProperty("value", h) end)
+  if not ok then self:wrn("Humidity child update failed: " .. tostring(err)) end
 end
 
 -- ------------------------------------------------------------
@@ -293,9 +300,6 @@ local function headersAuth()
   return {
     ["Content-Type"] = "application/json; charset=UTF-8",
     ["User-Agent"] = BYPASS_UA,
-    ["accept-language"] = LANG,
-    ["appVersion"] = AUTH_APP_VERSION,
-    ["clientVersion"] = AUTH_CLIENT_VERSION,
   }
 end
 
@@ -311,9 +315,31 @@ function QuickApp:headersApi()
   }
 end
 
+-- Redact before truncating: auth responses may contain reusable credentials.
+local function safeLogValue(value)
+  if type(value) ~= "table" then return value end
+  local out = {}
+  for k, v in pairs(value) do
+    local name = tostring(k):lower()
+    if name == "password" or name == "email" or name == "verifyemail"
+      or name == "authorizecode" or name == "token" or name == "biztoken"
+      or name == "accountid" then
+      out[k] = "[redacted]"
+    else
+      out[k] = safeLogValue(v)
+    end
+  end
+  return out
+end
+
+function QuickApp:newAuthTraceId(appID)
+  self._authCallNumber = (self._authCallNumber or 0) + 1
+  return ("APP%s%d-%05d"):format(appID, os.time(), self._authCallNumber)
+end
+
 function QuickApp:httpRequest(method, url, headers, body, cb)
   self:inf(("HTTP %s %s (loading)"):format(method, url))
-  self:dbg("HTTP body: " .. self:shortJson(body or {}, 400))
+  self:dbg("HTTP body: " .. self:shortJson(safeLogValue(body or {}), 1200))
 
   self.http:request(url, {
     options = {
@@ -324,7 +350,7 @@ function QuickApp:httpRequest(method, url, headers, body, cb)
     success = function(resp)
       self:inf(("HTTP %s %s -> status=%s (success)"):format(method, url, tostring(resp.status)))
       local ok, decoded = pcall(function() return json.decode(resp.data) end)
-      if ok then self:dbg("HTTP resp: " .. self:shortJson(decoded, 600)) end
+      if ok then self:dbg("HTTP resp: " .. self:shortJson(safeLogValue(decoded), 1200)) end
       cb(true, resp.status, ok and decoded or nil, resp.data)
     end,
     error = function(err)
@@ -353,12 +379,16 @@ function QuickApp:authStep1(terminalId, appID, cb)
     userCountryCode = self.countryCode,
     appID = appID,
     sourceAppID = appID,
-    traceId = "APP" .. appID .. tostring(math.floor(os.time()))
+    traceId = self:newAuthTraceId(appID)
   }
   local url = self.baseUrl .. "/globalPlatform/api/accountAuth/v1/authByPWDOrOTM"
   self:httpRequest("POST", url, headersAuth(), body, function(ok, status, data, raw)
-    if not ok or not data or data.code ~= 0 or not data.result then
-      cb(false, raw); return
+    if not ok or status ~= 200 or type(data) ~= "table"
+      or data.code ~= 0 or type(data.result) ~= "table" then
+      self:wrn(("Auth failed: HTTP=%s code=%s msg=%s"):format(
+        tostring(status), tostring(type(data) == "table" and data.code or "?"),
+        tostring(type(data) == "table" and data.msg or "Invalid/no JSON")))
+      cb(false); return
     end
     cb(true, data.result)
   end)
@@ -368,6 +398,8 @@ function QuickApp:authStep2(authorizeCode, bizToken, terminalId, appID, cb)
   local body = {
     method = "loginByAuthorizeCode4Vesync",
     authorizeCode = authorizeCode,
+    accountID = "",
+    token = "",
     acceptLanguage = LANG,
     clientInfo = AUTH_CLIENT_INFO,
     clientType = "vesyncApp",
@@ -378,14 +410,18 @@ function QuickApp:authStep2(authorizeCode, bizToken, terminalId, appID, cb)
     terminalId = terminalId,
     timeZone = TIMEZONE,
     userCountryCode = self.countryCode,
-    traceId = "APP" .. appID .. tostring(math.floor(os.time()))
+    traceId = self:newAuthTraceId(appID)
   }
   if bizToken then body.bizToken = bizToken end
 
   local url = self.baseUrl .. "/user/api/accountManage/v1/loginByAuthorizeCode4Vesync"
   self:httpRequest("POST", url, headersAuth(), body, function(ok, status, data, raw)
-    if not ok or not data or data.code ~= 0 or not data.result then
-      cb(false, raw); return
+    if not ok or status ~= 200 or type(data) ~= "table"
+      or data.code ~= 0 or type(data.result) ~= "table" then
+      self:wrn(("Auth failed: HTTP=%s code=%s msg=%s"):format(
+        tostring(status), tostring(type(data) == "table" and data.code or "?"),
+        tostring(type(data) == "table" and data.msg or "Invalid/no JSON")))
+      cb(false); return
     end
     cb(true, data.result)
   end)
@@ -396,16 +432,27 @@ function QuickApp:login(cb)
   self._busyLogin = true
   self:inf("Login started...")
 
-  local terminalId = "2" .. randStr(40)
-  local appID = randStr(8)
+  -- Match pyvesync's terminal format: prefix 2 plus 32 hex characters.
+  -- Reuse the identity for subsequent logins during this QA run.
+  if not self._authTerminalId then
+    local hex = {}
+    for i = 1, 32 do hex[i] = ("%x"):format(math.random(0, 15)) end
+    self._authTerminalId = "2" .. table.concat(hex)
+  end
+  local terminalId = self._authTerminalId
+  local appID = "eldodkfj"
 
+  local authStarted = os.time()
+  self:inf("Auth start UTC=" .. os.date("!%Y-%m-%dT%H:%M:%SZ", authStarted))
   self:authStep1(terminalId, appID, function(ok, r1)
-    if not ok or not r1 or not r1.authorizeCode then
+    if not ok or type(r1) ~= "table" or type(r1.authorizeCode) ~= "string" or r1.authorizeCode == "" then
       self._busyLogin = false
       cb(false); return
     end
 
-    self:authStep2(r1.authorizeCode, r1.bizToken, terminalId, appID, function(ok2, r2)
+    self:inf(("Auth code received: length=%d; exchanging after %ds"):format(#r1.authorizeCode, os.time() - authStarted))
+    -- Initial exchange has no region-change bizToken (matches pyvesync).
+    self:authStep2(r1.authorizeCode, nil, terminalId, appID, function(ok2, r2)
       self._busyLogin = false
       if not ok2 or not r2 then cb(false); return end
       self.token = r2.token
