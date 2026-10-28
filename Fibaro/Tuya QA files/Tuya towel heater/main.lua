@@ -1,3 +1,4 @@
+-- 2026-10-28: deduplicate temperature forwarding; TCP error diagnostics; 15s heartbeat.
 -- Thermostat auto should handle actions: setThermostatMode, setCoolingThermostatSetpoint, setHeatingThermostatSetpoint
 -- Proeprties that should be updated:
 -- * supportedThermostatModes - array of modes supported by the thermostat eg. {"Off", "Heat"}
@@ -38,7 +39,9 @@ function QuickApp:onInit()
     self:debug("onInit")
     self.enabled = api.get("/devices/"..self.id).enabled
     self.showdebug = true
-    self.connect_timeout = tonumber(self:getVariable("timeout")) * 1000
+    self.connect_timeout = (tonumber(self:getVariable("timeout")) or 5) * 1000
+    self.temperatureDeviceId = tonumber(self:getVariable("temperatureDeviceId")) or 488
+    self._lastForwardedTemperature = nil
     self.devID = self:getVariable("devID")
     self.devKEY = self:getVariable("devKEY")
     self.devVER = self:getVariable("devVER")
@@ -274,8 +277,8 @@ function QuickApp:connect()
             self.sock:connect(self.ip, self.port, {
                 success = function()
                     self.sock:write(payload)
-                    -- ping every 60 seconds
-                    self.pingloopID = setInterval(function() self:pingTuya() end, 60000)
+                    -- Keep the LAN session alive before the observed ~30s disconnect.
+                    self.pingloopID = setInterval(function() self:pingTuya() end, 15000)
                     self:waitForData()
                     self:updateEnergyValues()
                 end,
@@ -311,6 +314,22 @@ function QuickApp:disconnect()
     end
 end 
 
+-- This forwards a measured temperature to the existing temperature QA.
+-- It does not change the heater setpoint (DPS 2).
+function QuickApp:forwardCurrentTemperature(value)
+    local temperature = tonumber(value)
+    if not temperature or temperature ~= temperature then return end
+    if self._lastForwardedTemperature == temperature then return end
+    local ok, err = pcall(function()
+        hub.call(self.temperatureDeviceId or 488, "setTemperature", temperature)
+    end)
+    if ok then
+        self._lastForwardedTemperature = temperature
+    else
+        self:warning("Temperature forwarding failed: " .. tostring(err))
+    end
+end
+
 function QuickApp:waitForData()
     if self.enabled then
         self.sock:read({
@@ -323,11 +342,14 @@ function QuickApp:waitForData()
                     if self.showdebug then print("CB" ..tostring(commandByte)) end
                     if self.showdebug then print("SN" ..tostring(sequenceN)) end
                     if (tonumber(commandByte) == tuyAPI.tuyaCommandType.DP_QUERY or tonumber(commandByte) == tuyAPI.tuyaCommandType.STATUS) then
-                        if payload then resp = payload.dps
+                        if type(payload) == "table" and type(payload.dps) == "table" then
+                            local resp = payload.dps
                             local dpTimestamp = payload.t
                             if resp and resp['1'] ~= nil and resp['1'] == false then 
+                                currentThermostatMode = "Off"
                                 self:updateProperty("thermostatMode", "Off")
                             elseif resp and resp['1'] ~= nil and resp['1'] == true then 
+                                currentThermostatMode = "Heat"
                                 self:updateProperty("thermostatMode", "Heat")
                             end
                             if resp and resp['2'] ~= nil then 
@@ -339,7 +361,7 @@ function QuickApp:waitForData()
                             if resp and resp['3'] ~= nil then
                                 currentTemp = resp['3']
                                 local currentTempString = "Current temperature: "..tostring(currentTemp).." °C"
-                                hub.call(488, "setTemperature", resp['3'])
+                                self:forwardCurrentTemperature(resp['3'])
                                 self:updateView("labelCurrentTemperature", "text", currentTempString)
                             end
                             if resp and resp['4'] ~= nil then
@@ -377,7 +399,7 @@ function QuickApp:waitForData()
                                 end
                                 self:updateView("labelCurrentMode", "text", currentModeString)
                             end
-                            if resp['11'] ~= nil then
+                            if resp and resp['11'] ~= nil then
                                 local newState = resp['11']
                                 if workState ~= newState then
                                     workState = newState
@@ -397,14 +419,15 @@ function QuickApp:waitForData()
                 end
                 self:waitForData()
             end,
-            error = function()
-                if self.showdebug then self:debug("tuya QA - data response error") end
+            error = function(err)
+                self:warning("Tuya socket read failed: " .. tostring(err))
                 self.sock:close()
                 self.sequenceN = 1
                 self:disconnect()
                 self:updateView("labelStatus", "text", "Connection error")
                 self.dataloopID = fibaro.setTimeout(self.connect_timeout, function() self:connect() end)
-            end
+            end,
+            timeout = 120000
         })
     end
 end
@@ -423,7 +446,12 @@ function QuickApp:pingTuya()
             success = function()
                 if self.showdebug then self:debug("tuya QA - HEART_BEAT sent") end
                 self:updateView("labelStatus", "text", "Connected successfully")
-                fibaro.setTimeout(60000, function() self:updateTuyaState() end)
+                -- Poll at most once per minute; do not queue untracked timers.
+                local now = os.time()
+                if not self._lastStateQueryAt or now - self._lastStateQueryAt >= 60 then
+                    self._lastStateQueryAt = now
+                    self:updateTuyaState()
+                end
             end,
             error = function(err)
                 if self.showdebug then self:debug("tuya QA - error while sending HEART_BEAT") end
