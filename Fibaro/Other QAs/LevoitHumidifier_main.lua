@@ -735,9 +735,12 @@ end
 -- Status -> UI mapping (based on your payload)
 -- ------------------------------------------------------------
 function QuickApp:extractStateFromResponse(data)
-  if not data then return nil end
-  if data.result and data.result.result and type(data.result.result) == "table" then return data.result.result end
-  if type(data.result) == "table" and data.result.humidity ~= nil then return data.result end
+  if type(data) ~= "table" then return nil end
+  local result = data.result
+  -- HC3 JSON null may be represented by a function, not a table.
+  if type(result) ~= "table" then return nil end
+  if type(result.result) == "table" then return result.result end
+  if result.humidity ~= nil then return result end
   return nil
 end
 
@@ -832,11 +835,14 @@ end
 function QuickApp:pollOnce()
   self:inf("Poll once...")
   self:getStatus(function(ok, status, data, raw)
-    if not ok or not data then self:pushWarningUI("Poll failed") return end
+    if not ok or type(data) ~= "table" then self:pushWarningUI("Poll failed") return end
     local state = self:extractStateFromResponse(data)
     if not state then
       self:pushWarningUI("Bad status payload shape")
-      self:dbg("Raw resp: " .. tostring(raw))
+      local inner = type(data.result) == "table" and data.result or {}
+      self:wrn(("Status response: HTTP=%s code=%s msg=%s innerCode=%s resultType=%s")
+        :format(tostring(status), tostring(data.code), tostring(data.msg),
+          tostring(inner.code), type(data.result)))
       return
     end
     self:dbg("State: " .. self:shortJson(state, 900))
