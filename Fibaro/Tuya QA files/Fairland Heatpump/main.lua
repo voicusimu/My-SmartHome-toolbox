@@ -1,3 +1,4 @@
+-- 2026-10-28: TCP keepalive, temperature deduplication, elapsed-time estimated energy.
 -- Thermostat auto should handle actions: setThermostatMode, setCoolingThermostatSetpoint, setHeatingThermostatSetpoint
 -- Proeprties that should be updated:
 -- * supportedThermostatModes - array of modes supported by the thermostat eg. {"Auto", "Off", "Heat", "Cool"}
@@ -87,7 +88,7 @@ function QuickApp:onInit()
     self:debug("onInit")
     self.enabled = api.get("/devices/"..self.id).enabled
     self.showdebug = true
-    self.connect_timeout = tonumber(self:getVariable("timeout")) * 1000
+    self.connect_timeout = (tonumber(self:getVariable("timeout")) or 5) * 1000
     self.devID = self:getVariable("devID")
     self.devKEY = self:getVariable("devKEY")
     self.devVER = self:getVariable("devVER")
@@ -99,6 +100,9 @@ function QuickApp:onInit()
     self.dataloopID = nil
     self.pingloopID = nil
     self.sequenceN = 1
+    self._energyLastAt = os.time()
+    self._energyLastPower = 0
+    self.energyLoopId = setInterval(function() self:updateEnergyValues() end, 60000)
     self:connect()
 
 end
@@ -207,6 +211,7 @@ function QuickApp:_updateCoolingSetpointFromDevice(v)
 end
 
 function QuickApp:updateConsumption()
+    self:updateEnergyValues()
     if currentPercentage == 0 then
         self:updateProperty("power", 0)
         self:updateProperty("log", "0 W")
@@ -218,19 +223,35 @@ function QuickApp:updateConsumption()
         self:updateProperty("log", "2800 W")
         self.childs.currentPowerChild:setValue(powerValue)
     end
+    self._energyLastPower = tonumber(self.properties.power) or 0
 end
 
+-- Estimated energy, based on the QA's reported power (not a hardware kWh reading).
 function QuickApp:updateEnergyValues()
-    local energyMeterId = self:getVariable("totalEnergyChild")
-    local totalConsumption = hub.getValue(energyMeterId, "value")
-    local newConsumption = totalConsumption
+    local now = os.time()
+    local previous = self._energyLastAt or now
+    self._energyLastAt = now
+    local power = tonumber(self.properties.power) or 0
+    local previousPower = self._energyLastPower or 0
+    self._energyLastPower = power
+    local elapsed = math.max(0, now - previous)
+    local child = self.childs and self.childs.totalEnergyChild
+    if not child then return end
+    local total = tonumber(hub.getValue(child.id, "value"))
+    if not total then return end
+    local energy = previousPower * elapsed / 3600000
+    if energy > 0 then child:updateProperty("value", total + energy) end
+end
 
-    if currentThermostatMode ~= "Off" then
-        local energyValue = currentPercentage * 28 / 60000
-        newConsumption = totalConsumption + energyValue
-        self:debug("Total Consumption: ", totalConsumption, "New total consumption: ", newConsumption)
-        self.childs.totalEnergyChild:setValue(newConsumption)
-    end
+function QuickApp:forwardCurrentTemperature(value)
+    local temperature = tonumber(value)
+    if not temperature or temperature ~= temperature then return end
+    if self._lastForwardedTemperature == temperature then return end
+    local ok, err = pcall(function()
+        hub.call(468, "setTemperature", temperature)
+    end)
+    if ok then self._lastForwardedTemperature = temperature
+    else self:warning("Temperature forwarding failed: " .. tostring(err)) end
 end
 
 function QuickApp:childDeviceExist(deviceId)
@@ -320,9 +341,9 @@ function QuickApp:connect()
                 success = function()
                     self.sock:write(payload)
                     -- ping every 60 seconds
-                    self.pingloopID = setInterval(function() self:pingTuya() end, 60000)
+                    self.pingloopID = setInterval(function() self:pingTuya() end, 15000)
                     self:waitForData()
-                    self:updateEnergyValues()
+
                 end,
                 error = function(err)
                     self.sock:close()
@@ -385,7 +406,7 @@ function QuickApp:waitForData()
                             if resp['102'] ~= nil then
                                 currentTemp = resp['102']
                                 local currentTemp = tostring(resp['102']).." °C"
-                                hub.call(468, "setTemperature", resp['102'])
+                                self:forwardCurrentTemperature(resp['102'])
                                 self:updateView("labelCurrentTemperature", "text", "Current temperature: "..currentTemp)
                             end
                             if resp['106'] ~= nil then 
@@ -444,14 +465,15 @@ function QuickApp:waitForData()
                 end
                 self:waitForData()
             end,
-            error = function()
-                if self.showdebug then self:debug("tuya QA - data response error") end
+            error = function(err)
+                self:warning("Tuya socket read failed: " .. tostring(err))
                 self.sock:close()
                 self.sequenceN = 1
                 self:disconnect()
                 self:updateView("labelStatus", "text", "Connection error")
                 self.dataloopID = fibaro.setTimeout(self.connect_timeout, function() self:connect() end)
-            end
+            end,
+            timeout = 120000
         })
     end
 end
@@ -480,7 +502,11 @@ function QuickApp:pingTuya()
             success = function()
                 if self.showdebug then self:debug("tuya QA - HEART_BEAT sent") end
                 self:updateView("labelStatus", "text", "Connected successfully")
-                fibaro.setTimeout(60000, function() self:updateTuyaState() end)
+                local now = os.time()
+                if not self._lastStateQueryAt or now - self._lastStateQueryAt >= 60 then
+                    self._lastStateQueryAt = now
+                    self:updateTuyaState()
+                end
             end,
             error = function(err)
                 if self.showdebug then self:debug("tuya QA - error while sending HEART_BEAT") end

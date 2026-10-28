@@ -1,3 +1,4 @@
+-- 2026-10-28: TCP keepalive, temperature deduplication, elapsed-time estimated energy.
 -- Thermostat auto should handle actions: setThermostatMode, setCoolingThermostatSetpoint, setHeatingThermostatSetpoint
 -- Proeprties that should be updated:
 -- * supportedThermostatModes - array of modes supported by the thermostat eg. {"Off", "Heat"}
@@ -37,7 +38,7 @@ function QuickApp:onInit()
     self:debug("onInit")
     self.enabled = api.get("/devices/"..self.id).enabled
     self.showdebug = true
-    self.connect_timeout = tonumber(self:getVariable("timeout")) * 1000
+    self.connect_timeout = (tonumber(self:getVariable("timeout")) or 5) * 1000
     self.devID = self:getVariable("devID")
     self.devKEY = self:getVariable("devKEY")
     self.devVER = self:getVariable("devVER")
@@ -49,6 +50,9 @@ function QuickApp:onInit()
     self.dataloopID = nil
     self.pingloopID = nil
     self.sequenceN = 1
+    self._energyLastAt = os.time()
+    self._energyLastPower = 0
+    self.energyLoopId = setInterval(function() self:updateEnergyValues() end, 60000)
     self:connect()
 end
 
@@ -146,11 +150,12 @@ end
 -- INTERNAL: update currentTemp
 function QuickApp:_updateCurrentTempFromDevice(v)
     currentTemp = v
-    hub.call(577, "setTemperature", v)
+    self:forwardCurrentTemperature(v)
     self:updateView("labelCurrentTemperature", "text", "Current temperature: ".. tostring(v) .. " °C")
 end
 
 function QuickApp:updateConsumption()
+    self:updateEnergyValues()
     local heatSetpoint = self.properties.heatingThermostatSetpoint.value
     if self.showDebug then self:debug("Garage heater mode: ", currentThermostatMode) end
     if currentThermostatMode == "Heat" then
@@ -178,30 +183,35 @@ function QuickApp:updateConsumption()
         self:updateProperty("power", 0)
         self:updateProperty("log", "0 W")
     end   
+    self._energyLastPower = tonumber(self.properties.power) or 0
 end
 
+-- Estimated energy, based on the QA's reported power (not a hardware kWh reading).
 function QuickApp:updateEnergyValues()
-    if self.showDebug then self:debug("Garage heater mode: ", currentThermostatMode) end
-    local heatSetpoint = self.properties.heatingThermostatSetpoint.value
-    local energyMeterId = self:getVariable("totalEnergyChild")
-    local totalConsumption = hub.getValue(energyMeterId, "value")
-    local newConsumption = totalConsumption
-    local energyValue = 0
-    if currentThermostatMode == "Heat" then
-        if self.showDebug then
-            self:debug("Heat Setpoint: ", heatSetpoint)
-            self:debug("Current temperature: ", currentTemp)
-        end
-        if currentPowerMode == "Low" then
-            -- this QA recconects every 37 secconds, and then it is the perfect time to update the energy value
-            energyValue = 1000 / 3600000 * 37
-        else 
-            energyValue = 2000 / 3600000 * 37
-        end
-        newConsumption = totalConsumption + energyValue
-        if self.showDebug then self:debug("Total Consumption: ", totalConsumption, "New total consumption: ", newConsumption) end
-        self.childs.totalEnergyChild:updateProperty("value", newConsumption)
-    end
+    local now = os.time()
+    local previous = self._energyLastAt or now
+    self._energyLastAt = now
+    local power = tonumber(self.properties.power) or 0
+    local previousPower = self._energyLastPower or 0
+    self._energyLastPower = power
+    local elapsed = math.max(0, now - previous)
+    local child = self.childs and self.childs.totalEnergyChild
+    if not child then return end
+    local total = tonumber(hub.getValue(child.id, "value"))
+    if not total then return end
+    local energy = previousPower * elapsed / 3600000
+    if energy > 0 then child:updateProperty("value", total + energy) end
+end
+
+function QuickApp:forwardCurrentTemperature(value)
+    local temperature = tonumber(value)
+    if not temperature or temperature ~= temperature then return end
+    if self._lastForwardedTemperature == temperature then return end
+    local ok, err = pcall(function()
+        hub.call(577, "setTemperature", temperature)
+    end)
+    if ok then self._lastForwardedTemperature = temperature
+    else self:warning("Temperature forwarding failed: " .. tostring(err)) end
 end
 
 function QuickApp:childDeviceExist(deviceId)
@@ -291,8 +301,8 @@ function QuickApp:connect()
                 success = function()
                     self.sock:write(payload)
                     -- ping every 60 seconds
-                    self.pingloopID = setInterval(function() self:pingTuya() end, 60000)
-                    self:updateEnergyValues()
+                    self.pingloopID = setInterval(function() self:pingTuya() end, 15000)
+
                     self:waitForData()
                 end,
                 error = function(err)
@@ -367,17 +377,15 @@ function QuickApp:waitForData()
                 end
                 self:waitForData()
             end,
-            error = function(error)
-                if self.showdebug then 
-                    self:debug("tuya QA - data response error") 
-                    self:debug(error)
-                end
+            error = function(err)
+                self:warning("Tuya socket read failed: " .. tostring(err))
                 self.sock:close()
                 self.sequenceN = 1
                 self:disconnect()
                 self:updateView("labelStatus", "text", "Connection error")
                 self.dataloopID = fibaro.setTimeout(self.connect_timeout, function() self:connect() end)
-            end
+            end,
+            timeout = 120000
         })
     end
 end
@@ -396,7 +404,11 @@ function QuickApp:pingTuya()
             success = function()
                 if self.showdebug then self:debug("tuya QA - HEART_BEAT sent") end
                 self:updateView("labelStatus", "text", "Connected successfully")
-                fibaro.setTimeout(60000, function() self:updateTuyaState() end)
+                local now = os.time()
+                if not self._lastStateQueryAt or now - self._lastStateQueryAt >= 60 then
+                    self._lastStateQueryAt = now
+                    self:updateTuyaState()
+                end
             end,
             error = function(err)
                 if self.showdebug then self:debug("tuya QA - error while sending HEART_BEAT") end
