@@ -1,4 +1,5 @@
 -- Smart Meter QuickApp for Fibaro HC3
+-- 2026-10-28: strip the complete 15-byte Tuya version header before JSON decoding.
 -- Device: Double Digital Meter (双路电流互感计量器 WiFi版)
 -- Protocol: Tuya LAN v3.5 (AES-128-GCM, 3-step session key negotiation)
 --
@@ -619,12 +620,22 @@ function QuickApp:handleDataPayload(plaintext, cmd)
         end
     end
 
-    if #json_str >= 3 and string.sub(json_str, 1, 1) == "3" then
-        local maybe_ver = string.sub(json_str, 1, 3)
-        if maybe_ver:match("^3%.[0-9]") then
-            json_str = string.sub(json_str, 4)
-            self:dbg("Stripped version prefix '" .. maybe_ver .. "'")
+    -- Tuya version header is 15 bytes: "3.x" + 12 metadata bytes.
+    -- Metadata is not necessarily zero (STATUS notifications contain counters).
+    local version = json_str:sub(1, 3)
+    if version:match("^3%.[0-9]$") then
+        if #json_str < 15 then
+            self:debug("Truncated Tuya version header: " .. #json_str .. " bytes")
+            return
         end
+        json_str = json_str:sub(16)
+        self:dbg("Stripped 15-byte version header '" .. version .. "'")
+    end
+
+    -- Some command acknowledgements contain only a return code.
+    if json_str == "" then
+        self:dbg("Empty data acknowledgement")
+        return
     end
 
     self:dbg("JSON string to decode: " .. json_str)
