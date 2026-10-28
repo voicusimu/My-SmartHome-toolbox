@@ -836,6 +836,16 @@ function QuickApp:pollOnce()
   self:inf("Poll once...")
   self:getStatus(function(ok, status, data, raw)
     if not ok or type(data) ~= "table" then self:pushWarningUI("Poll failed") return end
+    local inner = type(data.result) == "table" and data.result or {}
+    if tonumber(data.code) == -11300030 or tonumber(inner.code) == -11300030 then
+      if not self._deviceOffline then
+        self._deviceOffline = true
+        self:pushWarningUI("Device offline (VeSync)")
+        self:safeUpdateView("lblHumidity", "text", "—")
+        self:safeUpdateView("sldTarget", "visible", false)
+      end
+      return
+    end
     local state = self:extractStateFromResponse(data)
     if not state then
       self:pushWarningUI("Bad status payload shape")
@@ -844,6 +854,10 @@ function QuickApp:pollOnce()
         :format(tostring(status), tostring(data.code), tostring(data.msg),
           tostring(inner.code), type(data.result)))
       return
+    end
+    if self._deviceOffline then
+      self._deviceOffline = false
+      self:inf("Device online again")
     end
     self:dbg("State: " .. self:shortJson(state, 900))
     self:applyStatusToUI(state)
