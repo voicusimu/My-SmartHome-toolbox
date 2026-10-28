@@ -1,3 +1,4 @@
+-- Final 2026-10-28: paced API queue, GET coalescing, 429 cooldown, tiered polling,explicit child classes and deduplicated local child/UI updates.
 -- Thermostat heat should handle actions: setThermostatMode, setHeatingThermostatSetpoint
 -- Proeprties that should be updated:
 -- * supportedThermostatModes - array of modes supported by the thermostat eg. {"Off", "Heat"}
@@ -216,6 +217,12 @@ end
 ----------------------------------------
 
 function QuickApp:initChildren()
+  self:initChildDevices({
+    ["com.fibaro.temperatureSensor"] = QuickAppChild,
+    ["com.fibaro.multilevelSensor"] = QuickAppChild,
+    ["com.fibaro.powerMeter"] = QuickAppChild,
+    ["com.fibaro.energyMeter"] = QuickAppChild,
+  })
   self.childrenMap = self.childrenMap or {}
 
   local function loadId(key)
@@ -235,8 +242,8 @@ function QuickApp:initChildren()
 
   local function ensure(key, name, type)
     local id = self.childrenMap[key]
-    if id and fibaro.getType(id) then return id end
-    local child = self:createChildDevice({ name = name, type = type })
+    if id and self.childDevices[id] and self.childDevices[id].type == type then return id end
+    local child = self:createChildDevice({ name = name, type = type }, QuickAppChild)
     self.childrenMap[key] = child.id
     self:setVariable("child_" .. key, tostring(child.id))
     self:dbg("Created child " .. key .. " id=" .. tostring(child.id) .. " type=" .. tostring(type))
@@ -265,18 +272,24 @@ function QuickApp:initChildren()
   self:setChildUnit("opHours", "h")
 end
 
-function QuickApp:setChildValue(key, value)
+-- Update child objects directly, and only when the property changes.
+function QuickApp:setChildProperty(key, property, value)
   local id = self.childrenMap and self.childrenMap[key]
-  if not id then return end
-  fibaro.call(id, "updateProperty", "value", tonumber(value) or value)
+  local child = id and self.childDevices and self.childDevices[id]
+  if not child then return end
+  self._childPropertyCache = self._childPropertyCache or {}
+  local cacheKey = tostring(id) .. ":" .. property
+  if self._childPropertyCache[cacheKey] == value then return end
+  child:updateProperty(property, value)
+  self._childPropertyCache[cacheKey] = value
+end
+
+function QuickApp:setChildValue(key, value)
+  self:setChildProperty(key, "value", tonumber(value) or value)
 end
 
 function QuickApp:setChildUnit(key, unit)
-  local id = self.childrenMap and self.childrenMap[key]
-  if not id or not unit then return end
-  pcall(function()
-    fibaro.call(id, "updateProperty", "unit", tostring(unit))
-  end)
+  if unit then self:setChildProperty(key, "unit", tostring(unit)) end
 end
 
 ----------------------------------------
@@ -284,9 +297,11 @@ end
 ----------------------------------------
 
 function QuickApp:setLabel(id, text)
-  pcall(function()
-    self:updateView(id, "text", tostring(text))
-  end)
+  self._labelCache = self._labelCache or {}
+  local value = tostring(text)
+  if self._labelCache[id] == value then return end
+  local ok = pcall(function() self:updateView(id, "text", value) end)
+  if ok then self._labelCache[id] = value end
 end
 
 function QuickApp:setSliderValue(val)
@@ -431,7 +446,77 @@ end
 -- API
 ----------------------------------------
 
+-- At most one API request in flight, with at least one second between completions.
 function QuickApp:apiRequest(method, path, body, cb)
+  self._apiQueue = self._apiQueue or {}
+  self._apiGets = self._apiGets or {}
+  local key = method == "GET" and path or nil
+  if key and self._apiGets[key] then
+    if cb then table.insert(self._apiGets[key].callbacks, cb) end
+    return
+  end
+  local item = {method=method, path=path, body=body, callbacks={}, retries=0}
+  if cb then item.callbacks[1] = cb end
+  if key then self._apiGets[key] = item end
+  -- Commands go ahead of queued reads, preserving command order.
+  local index = #self._apiQueue + 1
+  if method ~= "GET" then
+    for i, queued in ipairs(self._apiQueue) do
+      if queued.method == "GET" then index = i; break end
+    end
+  end
+  table.insert(self._apiQueue, index, item)
+  self:_drainApiQueue()
+end
+
+function QuickApp:_drainApiQueue()
+  if self._apiBusy or self._apiTimer or not self._apiQueue or #self._apiQueue == 0 then return end
+  local delay = math.max(0, (self._apiNotBefore or 0) - os.time())
+  if delay > 0 then
+    self._apiTimer = setTimeout(function()
+      self._apiTimer = nil
+      self:_drainApiQueue()
+    end, delay * 1000)
+    return
+  end
+  local item = table.remove(self._apiQueue, 1)
+  self._apiBusy = true
+  self:_performApiRequest(item.method, item.path, item.body, function(ok, data, status, raw, headers)
+    self._apiBusy = false
+    local retry = false
+    if tonumber(status) == 429 then
+      self._apiBackoff = math.min(900, math.max(120, (self._apiBackoff or 60) * 2))
+      local retryAfter = 0
+      for name, value in pairs(type(headers) == "table" and headers or {}) do
+        if tostring(name):lower() == "retry-after" then retryAfter = tonumber(value) or 0 end
+      end
+      local pause = math.max(self._apiBackoff, retryAfter)
+      self._apiNotBefore = os.time() + pause
+      self:warning("Bosch API 429: pausing all API requests for " .. pause .. "s")
+      -- Retry reads once; never replay a command automatically.
+      retry = item.method == "GET" and item.retries < 1
+      if retry then
+        item.retries = item.retries + 1
+        table.insert(self._apiQueue, 1, item)
+      end
+    else
+      self._apiNotBefore = os.time() + 1
+      if tonumber(status) and tonumber(status) >= 200 and tonumber(status) < 300 then
+        self._apiBackoff = nil
+      end
+    end
+    if not retry then
+      if item.method == "GET" then self._apiGets[item.path] = nil end
+      for _, callback in ipairs(item.callbacks) do
+        local called, err = pcall(callback, ok, data, status, raw)
+        if not called then self:error("API callback failed: " .. tostring(err)) end
+      end
+    end
+    self:_drainApiQueue()
+  end)
+end
+
+function QuickApp:_performApiRequest(method, path, body, cb)
   local t0 = now()
   self:ensureAuth(function(ok)
     if not ok then
@@ -464,7 +549,7 @@ function QuickApp:apiRequest(method, path, body, cb)
           if raw ~= "" then self:dbg("RESP rawHead=" .. headStr(raw, 240)) end
         end
 
-        if cb then cb(true, data, resp.status, raw) end
+        if cb then cb(true, data, resp.status, raw, resp.headers) end
       end,
       error = function(err)
         self:error("HTTP error " .. method .. " " .. path .. " -> " .. tostring(err))
@@ -661,8 +746,11 @@ function QuickApp:refreshStatus()
   end
 
   local dhwId = self:getVariable("dhwId") or "dhw1"
-  -- Holiday
-    self:readHolidayMode(gw)
+  -- Slow resources: initial read, then every five minutes.
+  local clock = os.time()
+  local slowDue = not self._lastSlowRefresh or clock - self._lastSlowRefresh >= 300
+  if slowDue then self._lastSlowRefresh = clock end
+  if slowDue then self:readHolidayMode(gw) end
 
   -- Mode
   self:apiRequest("GET", dhwPath(gw, dhwId, "operationMode"), nil, function(ok, d, st, raw)
@@ -735,16 +823,17 @@ function QuickApp:refreshStatus()
   end)
 
   -- Lifetime water
-  self:readWaterTotalConsumption(gw)
+  if slowDue then self:readWaterTotalConsumption(gw) end
 
   -- Heat source bulk (power/pct/starts/hours) + energy integration
   self:readHsMonitorValues(gw)
 
 -- Total consumption
-  self:readElectricityTotalConsumption(gw)
+  if slowDue then self:readElectricityTotalConsumption(gw) end
 
   -- Presets once
-  if not self.presets then
+  if not self.presets and (not self._lastPresetAttempt or clock - self._lastPresetAttempt >= 300) then
+    self._lastPresetAttempt = clock
     self:readOperationSetpoints(gw, dhwId)
   end
 
@@ -759,9 +848,9 @@ function QuickApp:refreshStatus()
 end
 
 function QuickApp:getCurrentPollMs()
-  local baseMs = self.pollMs or 30000
+  local baseMs = math.max(60000, self.pollMs or 60000)
   if self.pollOverrideUntil and os.time() < self.pollOverrideUntil then
-    return (self.pollOverrideSec or 10) * 1000
+    return math.max(15000, (self.pollOverrideSec or 15) * 1000)
   end
   return baseMs
 end
@@ -807,6 +896,7 @@ function QuickApp:setHoliday(on)
       self:errCtx("SET holidayMode failed", st, raw)
       return
     end
+    self:readHolidayMode(gw)
     self:refreshStatus()
   end)
 end
